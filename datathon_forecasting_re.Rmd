@@ -1,0 +1,241 @@
+---
+title: "Datathon"
+author: "Xinhui Jing"
+date: "2025-10-01"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+
+
+# -------------------------
+# Load packages
+# -------------------------
+library(dplyr)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+
+```
+
+
+```{r}
+# ---- 1) Load data ----
+df <- read.csv("dynamic_supply_chain_logistics_dataset.csv", stringsAsFactors = FALSE)
+
+
+```
+
+```{r}
+
+# Convert timestamp -> Date (daily)
+df$timestamp <- as.POSIXct(df$timestamp, tz = "UTC")
+df$date <- as.Date(df$timestamp)
+
+# Quick check
+cat("Dataset shape:", dim(df)[1], "rows x", dim(df)[2], "cols\n")
+cat("Columns available:\n")
+print(colnames(df))
+
+# Ensure required columns exist
+reqs <- c(group_cols, metric, "date")
+missing_cols <- setdiff(reqs, colnames(df))
+if(length(missing_cols)>0) stop(paste("Missing required columns:", paste(missing_cols, collapse=", ")))
+```
+
+
+
+```{r}
+
+# -------------------------
+# 1️⃣ Prepare dataset
+# -------------------------
+df <- df %>% filter(!is.na(timestamp))
+df$timestamp <- as.POSIXct(df$timestamp, format="%Y-%m-%d %H:%M:%S")
+df <- df %>% mutate(year = year(timestamp))
+
+# -------------------------
+# 2️⃣ Create synthetic hierarchy
+# -------------------------
+df <- df %>%
+  mutate(
+    route_risk_bin = cut(route_risk_level, breaks = 6, labels = paste0("R", 1:6)),
+    port_cong_bin  = cut(port_congestion_level, breaks = 6, labels = paste0("P", 1:6))
+  )
+
+# Ensure all combinations exist for all timestamps
+all_keys <- expand.grid(
+  timestamp = unique(df$timestamp),
+  route_risk_bin = paste0("R", 1:6),
+  port_cong_bin  = paste0("P", 1:6)
+)
+
+df_full <- all_keys %>%
+  left_join(df, by = c("timestamp", "route_risk_bin", "port_cong_bin")) %>%
+  mutate(disruption_likelihood_score = ifelse(is.na(disruption_likelihood_score), 0, disruption_likelihood_score)) %>%
+  as_tsibble(key = c(route_risk_bin, port_cong_bin), index = timestamp)
+
+# Build hierarchical tsibble
+supply_hier <- df_full %>%
+  aggregate_key(route_risk_bin / port_cong_bin,
+                disruption_likelihood_score = sum(disruption_likelihood_score))
+
+# -------------------------
+# 3️⃣ Split train/test
+# -------------------------
+train_data <- supply_hier %>% filter(year(timestamp) %in% c(2021, 2022, 2023))
+test_data  <- supply_hier %>% filter(year(timestamp) == 2024)
+
+# Forecast horizon
+n_test <- test_data %>%
+  group_by(route_risk_bin, port_cong_bin) %>%
+  summarise(n = n(), .groups = "drop") %>% pull(n) %>% max()
+
+# -------------------------
+# 4️⃣ Fill gaps for ETS
+# -------------------------
+train_data <- train_data %>%
+  fill_gaps(.full = TRUE, disruption_likelihood_score = 0)
+
+# -------------------------
+# 5️⃣ Fit base ETS model
+# -------------------------
+base_fit <- train_data %>%
+  model(ETS = ETS(disruption_likelihood_score))
+
+# -------------------------
+# 6️⃣ Forecast reconciliation
+# -------------------------
+recon_fc <- base_fit %>%
+  reconcile(
+    BU  = bottom_up(ETS),
+    OLS = min_trace(ETS, method = "ols"),
+    WLS = min_trace(ETS, method = "wls_struct")
+  ) %>%
+  forecast(h = n_test)
+
+# -------------------------
+# 7️⃣ Align forecast & test data for SMAPE
+# -------------------------
+fc_tbl <- recon_fc %>% as_tibble() %>%
+  select(timestamp, route_risk_bin, port_cong_bin, .model, .mean)
+
+smape_tbl <- fc_tbl %>%
+  left_join(
+    test_data %>% as_tibble() %>% select(timestamp, route_risk_bin, port_cong_bin, disruption_likelihood_score),
+    by = c("timestamp", "route_risk_bin", "port_cong_bin")
+  ) %>%
+  rename(actual = disruption_likelihood_score, forecast = .mean)
+
+# -------------------------
+# 8️⃣ Compute accuracy metrics
+# -------------------------
+# Standard metrics
+acc <- accuracy(recon_fc, test_data) %>%
+  group_by(.model) %>%
+  summarise(
+    MAPE = mean(MAPE, na.rm = TRUE),
+    RMSE = mean(RMSE, na.rm = TRUE)
+  )
+
+# SMAPE
+smape_summary <- smape_tbl %>%
+  group_by(.model) %>%
+  summarise(
+    SMAPE = mean(2 * abs(forecast - actual) / (abs(forecast) + abs(actual)), na.rm = TRUE)
+  )
+
+# Combine
+acc_summary <- acc %>%
+  left_join(smape_summary, by = ".model") %>%
+  arrange(MAPE)
+
+print(acc_summary)
+
+# -------------------------
+# 9️⃣ Optional: plot example for one route_risk_bin
+# -------------------------
+example_hist <- supply_hier %>%
+  filter(route_risk_bin == "R3", is_aggregated(port_cong_bin))
+
+example_fc <- recon_fc %>%
+  filter(route_risk_bin == "R3", is_aggregated(port_cong_bin))
+
+autoplot(example_fc, level = NULL) +
+  autolayer(example_hist, disruption_likelihood_score, alpha = 0.3) +
+  labs(title = "Reconciled forecasts – Route Risk R3 (total)",
+       y = "Disruption Likelihood Score") +
+  theme_bw()
+
+
+
+
+
+
+
+# -------------------------
+# 🔍 Coherence check table
+# -------------------------
+library(dplyr)
+
+# Convert reconciled forecasts to tibble
+fc_tbl <- recon_fc %>% as_tibble()
+
+# Compute total forecast at top level
+total_fc <- fc_tbl %>%
+  filter(is_aggregated(route_risk_bin), is_aggregated(port_cong_bin)) %>%
+  group_by(.model) %>%
+  summarise(total = sum(.mean, na.rm = TRUE), .groups = "drop")
+
+# Compute sum of bottom-level forecasts
+bottom_fc <- fc_tbl %>%
+  filter(!is_aggregated(route_risk_bin), !is_aggregated(port_cong_bin)) %>%
+  group_by(.model) %>%
+  summarise(sum_bottom = sum(.mean, na.rm = TRUE), .groups = "drop")
+
+# Combine and calculate difference
+coherence_tbl <- total_fc %>%
+  left_join(bottom_fc, by = ".model") %>%
+  mutate(diff_total_minus_bottom = total - sum_bottom)
+
+print(coherence_tbl)
+
+
+```
+
+
+### What I observe in the chart:
+
+Y-axis = Disruption Likelihood Score (0 to 1):
+
+Most of the historical data points are very close to 1, which suggests that historically, disruptions were highly likely across Route R3.
+
+Occasionally, you see sharp dips below 1, but they are rare.
+
+Forecasts (coloured points by model: BU, ETS, OLS, WLS):
+
+Near the end of the timeline (2024), your reconciled forecasts (BU, ETS, OLS, WLS) are plotted.
+
+Notice that one of the models (purple, WLS) is forecasting a very low disruption score compared to the past.
+
+This means some models predict conditions will improve, while others might remain conservative.
+
+Historical pattern vs. forecast:
+
+The historical trend shows persistent disruption risks.
+
+Forecasting gives you an early warning system: which model predicts sustained risk, and which predicts reduction.
+
+
+
+```{r}
+```
+

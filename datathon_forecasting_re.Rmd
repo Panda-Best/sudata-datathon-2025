@@ -161,7 +161,7 @@ acc_summary <- acc %>%
 print(acc_summary)
 
 # -------------------------
-# 9️⃣ Optional: plot example for one route_risk_bin
+# 9️⃣ plot example for one route_risk_bin
 # -------------------------
 example_hist <- supply_hier %>%
   filter(route_risk_bin == "R3", is_aggregated(port_cong_bin))
@@ -237,5 +237,107 @@ Forecasting gives you an early warning system: which model predicts sustained ri
 
 
 ```{r}
+library(tibble)
+
+risk_bins <- tibble(
+  Bin = paste0("R", 1:6),
+  Label = paste0("R", 1:6),
+  Risk_Range = c("0.0 – 1.67",
+                 "1.67 – 3.33",
+                 "3.33 – 5.00",
+                 "5.00 – 6.67",
+                 "6.67 – 8.33",
+                 "8.33 – 10.0"),
+  Interpretation = c("Very Low Risk",
+                     "Low Risk",
+                     "Medium-Low Risk",
+                     "Medium-High Risk",
+                     "High Risk",
+                     "Very High Risk")
+)
+
+print(risk_bins)
+```
+
+
+```{r}
+supply_hier
+
+
+```
+
+
+
+```{r}
+# -------------------------
+# 📊 Risk Bin Definitions
+# -------------------------
+risk_bins <- tibble::tibble(
+  Bin = paste0("R", 1:6),
+  Label = paste0("R", 1:6),
+  Risk_Range = c("0.0 – 1.67", "1.67 – 3.33", "3.33 – 5.00",
+                 "5.00 – 6.67", "6.67 – 8.33", "8.33 – 10.0"),
+  Interpretation = c("Very Low Risk", "Low Risk", "Medium-Low Risk",
+                     "Medium-High Risk", "High Risk", "Very High Risk")
+)
+
+# -------------------------
+# 📉 Average disruption score per bin (2024 only)
+# -------------------------
+bin_scores <- supply_hier %>%
+  filter(route_risk_bin != "<aggregated>") %>%
+  mutate(route_risk_bin = as.character(route_risk_bin),
+         year = year(timestamp)) %>%
+  filter(year == 2024) %>%
+  group_by(route_risk_bin) %>%
+  summarise(avg_disruption_score = mean(disruption_likelihood_score, na.rm = TRUE)) %>%
+  ungroup()
+
+# -------------------------
+# 🧾 Final table: bins + interpretations + scores
+# -------------------------
+risk_summary <- risk_bins %>%
+  left_join(bin_scores, by = c("Bin" = "route_risk_bin"))
+
+print(risk_summary)
+
+
+```
+
+
+```{r}
+library(ggplot2)
+library(fabletools)
+
+# Loop through all route_risk_bin categories
+route_bins <- paste0("R", 1:6)
+
+for (r_bin in route_bins) {
+  
+  # Historical aggregated data for this route_risk_bin
+  example_hist <- supply_hier %>%
+    filter(route_risk_bin == r_bin, is_aggregated(port_cong_bin))
+  
+  # Forecast aggregated data for this route_risk_bin
+  example_fc <- recon_fc %>%
+    filter(route_risk_bin == r_bin, is_aggregated(port_cong_bin))
+  
+  # Plot
+  p <- autoplot(example_fc, level = NULL) +
+    autolayer(example_hist, disruption_likelihood_score, alpha = 0.3) +
+    labs(
+      title = paste0("Reconciled forecasts – Route Risk ", r_bin, " (total)"),
+      y = "Disruption Likelihood Score"
+    ) +
+    theme_bw()
+  
+  print(p)  # display plot in RStudio
+  
+  # Optional: save plot
+  # ggsave(filename = paste0("Forecast_", r_bin, ".png"), plot = p, width = 8, height = 5)
+}
+
+
+
 ```
 
